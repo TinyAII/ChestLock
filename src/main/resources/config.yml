@@ -1,0 +1,12 @@
+# ChestLock 箱子锁 配置
+settings:
+  # 建锁方式：蹲下（潜行）手持告示牌贴在箱子/潜影盒侧面 → 自动上锁并显示主人名
+  owner-line: "&7[&e{player}&7]"
+  protect-from-break: true      # 锁箱防破坏（主人也不能破坏，除非先拆牌子）
+  protect-from-hopper: true     # 锁箱防漏斗抽取/投入
+  allow-shulker: true           # 潜影盒也可用牌子锁
+
+messages:
+  prefix: "&7[&c锁&7] &r"
+  locked: "&a箱子已上锁，主人: &e{player}"
+  denied: "&c这个箱子已上锁（主人: &e{player}&c）。"
