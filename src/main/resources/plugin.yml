@@ -1,0 +1,7 @@
+name: ChestLock
+version: 1.0.0
+main: nl.tinyaii.chestlock.ChestLockPlugin
+api-version: 1.16
+author: TinyAII
+description: 箱子锁 - 放告示牌锁箱，显示主人名，防破坏防漏斗
+website: https://github.com/TinyAII
