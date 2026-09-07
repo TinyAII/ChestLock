@@ -23,10 +23,11 @@ import org.bukkit.inventory.ItemStack;
 import java.util.UUID;
 
 /**
- * 箱子锁核心：
- *  - 蹲下贴告示牌在容器侧面 → 自动上锁（牌子自动写 [锁] + [主人名]，不弹编辑界面）
- *  - 权限：锁主开箱/拆箱正常，别人被拦
- *  - 防破坏：锁箱防 TNT/爆炸
+ * 箱子锁/门锁核心：
+ *  - 蹲下贴告示牌在容器/门旁边 → 自动上锁（牌子自动写 [锁] + [主人名]，不弹编辑界面）
+ *  - 门锁：牌子贴在门的前后左右任意方块上 → 锁住相邻的门；主人右键开门需权限
+ *  - 权限：锁主开箱/开门正常，别人被拦
+ *  - 防破坏：锁箱/锁门防 TNT/爆炸
  *  - 防漏斗：锁箱防漏斗抽取/投入
  */
 public class ChestLockListener implements Listener {
@@ -52,27 +53,49 @@ public class ChestLockListener implements Listener {
         return m.name().endsWith("_SHULKER_BOX");
     }
 
+    private boolean isDoor(Material m) {
+        return m != null && m.name().endsWith("_DOOR");
+    }
+
+    /** 门是上下两格，统一取底部方块作为锁的 key（防数据错乱） */
+    private Block doorBottom(Block block) {
+        if (!isDoor(block.getType())) return block;
+        try {
+            org.bukkit.block.data.type.Door door = (org.bukkit.block.data.type.Door) block.getBlockData();
+            if (door.getHalf() == org.bukkit.block.data.type.Door.Half.BOTTOM) return block;
+            Block below = block.getRelative(BlockFace.DOWN);
+            if (below.getType() == block.getType()) return below;
+        } catch (Exception ignored) {}
+        return block;
+    }
+
+    /** 可锁方块 = 容器 ∪ 门 */
+    private boolean isLockable(Material m) {
+        return isContainer(m) || isDoor(m);
+    }
+
     private boolean isSign(Material m) {
         return m.name().endsWith("_SIGN") || m.name().endsWith("_WALL_SIGN");
     }
 
     /**
-     * 蹲下贴牌建锁：玩家蹲下放告示牌在容器侧面 → 正常放置（客户端可见），延迟1tick自动写 [锁]+[主人名] 并建锁。
+     * 蹲下贴牌建锁：玩家蹲下放告示牌在容器/门侧面 → 正常放置（客户端可见），延迟1tick自动写 [锁]+[主人名] 并建锁。
      * 不取消 BlockPlaceEvent（避免客户端不同步导致牌子消失）。
      */
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     public void onBlockPlace(BlockPlaceEvent e) {
         Player p = e.getPlayer();
-        if (!p.isSneaking()) return;                       // 必须蹲下
         if (!isSign(e.getBlock().getType())) return;        // 必须放告示牌
         Block placed = e.getBlockPlaced();
 
-        // 蹲下放牌子：找相邻容器
-        Block container = findAttachedContainer(placed);
-        if (container == null || !isContainer(container.getType())) return;
-        // 已锁 → 若主人蹲下贴 = 扩展牌（留空等主人写授权名，不自动显示授权名单/授权玩家字样）
-        if (manager.isLocked(container)) {
-            UUID owner = manager.getOwner(container);
+        // 找相邻容器/门
+        Block target = findAttachedLockable(placed);
+        if (target == null || !isLockable(target.getType())) return;
+        // 箱子需要蹲下才锁，门不需要蹲下
+        if (isContainer(target.getType()) && !p.isSneaking()) return;
+        // 已锁 → 若主人贴 = 扩展牌
+        if (manager.isLocked(target)) {
+            UUID owner = manager.getOwner(target);
             if (owner != null && owner.equals(p.getUniqueId())) {
                 // 主人扩展牌：第1行写 【...】，其余留空（等主人编辑写授权玩家名）
                 final Block extSign = placed;
@@ -87,16 +110,17 @@ public class ChestLockListener implements Listener {
                     p.sendMessage(Messages.color("&a已添加扩展牌，右键编辑在【】内写玩家名即可授权。"));
                 }, 1L);
             } else {
+                String label = isDoor(target.getType()) ? "门" : "箱子";
                 e.setCancelled(true);
                 p.sendMessage(Messages.color(plugin.getConfig().getString("messages.prefix", "&7[&c锁&7] &r")
-                        + "&c这个箱子已上锁。"));
+                        + "&c这个" + label + "已上锁。"));
             }
             return;
         }
         // 不取消放置；延迟 1 tick 写文字 + 建锁（等牌子 TileState 就绪）
         final UUID ownerUuid = p.getUniqueId();
         final String ownerName = p.getName();
-        final Block containerBlock = container;
+        final Block lockTarget = target;
         final Block signBlock = placed;
         plugin.getServer().getScheduler().runTaskLater(plugin, () -> {
             // 牌子被拆了/换了 → 跳过
@@ -108,7 +132,7 @@ public class ChestLockListener implements Listener {
             sign.setLine(1, Messages.color(ownerLine));
             sign.setLine(2, Messages.color("&7【...】"));   // 自动补授权行
             sign.update(true, false);
-            manager.lock(containerBlock, ownerUuid);
+            manager.lock(lockTarget, ownerUuid);
             Player online = plugin.getServer().getPlayer(ownerUuid);
             if (online != null) {
                 online.sendMessage(Messages.color(plugin.getConfig().getString("messages.locked", "&a箱子已上锁，主人: &e{player}")
@@ -132,12 +156,12 @@ public class ChestLockListener implements Listener {
         boolean isExtSign = line0 != null && line0.contains("【");
         if (!isLockSign && !isExtSign) return;
 
-        Block container = findAttachedContainer(signBlock);
-        if (container == null || !manager.isLocked(container)) return;
+        Block target = findAttachedLockable(signBlock);
+        if (target == null || !manager.isLocked(target)) return;
 
         // 只有主人能编辑授权
         Player p = e.getPlayer();
-        UUID owner = manager.getOwner(container);
+        UUID owner = manager.getOwner(target);
         if (owner == null || !owner.equals(p.getUniqueId())) {
             if (!(p.isOp() || p.hasPermission("chestlock.bypass"))) {
                 e.setCancelled(true);
@@ -158,7 +182,7 @@ public class ChestLockListener implements Listener {
         BlockFace[] faces = {BlockFace.NORTH, BlockFace.SOUTH, BlockFace.EAST, BlockFace.WEST,
                 BlockFace.UP, BlockFace.DOWN};
         for (BlockFace f : faces) {
-            Block rel = container.getRelative(f);
+            Block rel = target.getRelative(f);
             if (rel.equals(signBlock)) continue;   // 当前编辑的已处理
             if (rel.getState() instanceof Sign) {
                 Sign s = (Sign) rel.getState();
@@ -169,10 +193,10 @@ public class ChestLockListener implements Listener {
             }
         }
         // 写回授权名单
-        manager.clearAccess(container);
-        for (UUID u : allAccess) manager.addAccessDirect(container, u);
+        manager.clearAccess(target);
+        for (UUID u : allAccess) manager.addAccessDirect(target, u);
         manager.save();
-        manager.syncSignAccess(container);
+        manager.syncSignAccess(target);
         p.sendMessage(Messages.color("&a授权玩家已更新。"));
     }
 
@@ -192,49 +216,47 @@ public class ChestLockListener implements Listener {
         }
     }
 
-    /** 遍历牌子相邻方块（4向+上下）找容器 */
-    private Block findAttachedContainer(Block signBlock) {
-        BlockFace[] faces = {BlockFace.NORTH, BlockFace.SOUTH, BlockFace.EAST, BlockFace.WEST,
-                BlockFace.UP, BlockFace.DOWN};
-        for (BlockFace f : faces) {
-            Block rel = signBlock.getRelative(f);
-            if (isContainer(rel.getType())) return rel;
-        }
-        return null;
-    }
-
-    // ===== 权限：开箱 =====
+    // ===== 权限：开箱/开门 =====
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onInteract(PlayerInteractEvent e) {
         if (e.getAction() != Action.RIGHT_CLICK_BLOCK) return;
         Block clicked = e.getClickedBlock();
-        if (clicked == null || !isContainer(clicked.getType())) return;
-        if (!manager.isLocked(clicked)) return;
+        if (clicked == null || !isLockable(clicked.getType())) return;
+        // 门：统一用底部方块作 key
+        Block target = isDoor(clicked.getType()) ? doorBottom(clicked) : clicked;
+        if (!manager.isLocked(target)) return;
         Player p = e.getPlayer();
-        UUID owner = manager.getOwner(clicked);
-        if (owner != null && owner.equals(p.getUniqueId())) return;   // 主人开箱放行
-        if (manager.hasAccess(clicked, p.getUniqueId())) return;       // 授权玩家开箱放行（只有打开权）
+        UUID owner = manager.getOwner(target);
+        if (owner != null && owner.equals(p.getUniqueId())) return;   // 主人开箱/开门放行
+        if (manager.hasAccess(target, p.getUniqueId())) return;       // 授权玩家开箱/开门放行
         if (p.isOp() || p.hasPermission("chestlock.bypass")) return;
         e.setCancelled(true);
+        String label = isDoor(clicked.getType()) ? "门" : "箱子";
         String ownerName = owner != null ? plugin.getServer().getOfflinePlayer(owner).getName() : "?";
-        p.sendMessage(Messages.color(plugin.getConfig().getString("messages.denied", "&c这个箱子已上锁（主人: &e{player}&c）。")
-                .replace("{player}", ownerName)));
+        p.sendMessage(Messages.color(plugin.getConfig().getString("messages.denied", "&c这个{label}已上锁（主人: &e{player}&c）。")
+                .replace("{label}", label).replace("{player}", ownerName)));
     }
 
-    // ===== 防拆：箱子/锁牌 =====
+    // ===== 防拆：箱子/门/锁牌 =====
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onBreak(BlockBreakEvent e) {
         Player p = e.getPlayer();
         Block b = e.getBlock();
-        // 拆箱子（含潜影盒）
-        if (isContainer(b.getType()) && manager.isLocked(b)) {
-            UUID owner = manager.getOwner(b);
-            if (owner != null && owner.equals(p.getUniqueId())) { manager.unlock(b); return; }
-            // 授权玩家只有打开权，不能拆
-            if (p.isOp() || p.hasPermission("chestlock.bypass")) { manager.unlock(b); return; }
+        boolean isDoor = isDoor(b.getType());
+
+        // 拆门：统一用底部方块作 key
+        Block target = isDoor ? doorBottom(b) : b;
+
+        // 拆箱子/门（含潜影盒）
+        if (isLockable(b.getType()) && manager.isLocked(target)) {
+            UUID owner = manager.getOwner(target);
+            if (owner != null && owner.equals(p.getUniqueId())) { manager.unlock(target); return; }
+            if (p.isOp() || p.hasPermission("chestlock.bypass")) { manager.unlock(target); return; }
             e.setCancelled(true);
-            p.sendMessage(Messages.color(plugin.getConfig().getString("messages.denied", "&c这个箱子已上锁（主人: &e{player}&c）。")
-                    .replace("{player}", plugin.getServer().getOfflinePlayer(owner).getName())));
+            String label = isDoor ? "门" : "箱子";
+            String ownerName = owner != null ? plugin.getServer().getOfflinePlayer(owner).getName() : "?";
+            p.sendMessage(Messages.color(plugin.getConfig().getString("messages.denied", "&c这个{label}已上锁（主人: &e{player}&c）。")
+                    .replace("{label}", label).replace("{player}", ownerName)));
             return;
         }
         // 拆锁牌/扩展牌：主人才能拆。
@@ -247,9 +269,10 @@ public class ChestLockListener implements Listener {
             boolean isLockSign = sign.getLine(0) != null && sign.getLine(0).contains("锁");
             boolean isExtSign = sign.getLine(0) != null && sign.getLine(0).contains("【");
             if (isLockSign || isExtSign) {
-                Block container = findAttachedContainer(b);
-                if (container != null && manager.isLocked(container)) {
-                    UUID owner = manager.getOwner(container);
+                // 门上的牌子 → 找相邻门；普通容器 → 找相邻容器
+                Block attached = findAttachedLockable(b);
+                if (attached != null && manager.isLocked(attached)) {
+                    UUID owner = manager.getOwner(attached);
                     boolean canBreak = owner != null && owner.equals(p.getUniqueId())
                             || p.isOp() || p.hasPermission("chestlock.bypass");
                     if (!canBreak) {
@@ -259,31 +282,31 @@ public class ChestLockListener implements Listener {
                     }
                     if (isLockSign) {
                         // 主锁牌：检查容器周围是否还有扩展牌
-                        if (hasExtSign(container, b)) {
+                        if (hasExtSign(attached, b)) {
                             // 还有扩展牌 → 主锁牌不能拆（避免拆错，从根源杜绝）
                             e.setCancelled(true);
                             p.sendMessage(Messages.color("&c这是主锁牌，请先拆除其他扩展牌。"));
                             return;
                         }
                         // 没有扩展牌 → 拆主锁牌 = 解锁
-                        manager.unlock(container);
+                        manager.unlock(attached);
                         return;
                     }
                     // 扩展牌：拆了 → 该牌上的授权玩家解除权限（重新计算剩余牌授权并集）
-                    removeAccessFromSign(container, sign);
+                    removeAccessFromSign(attached, sign);
                     manager.save();
-                    manager.syncSignAccess(container);
+                    manager.syncSignAccess(attached);
                 }
             }
         }
     }
 
-    /** 检查容器周围是否还有其他扩展牌（第1行含【，排除被拆的 b） */
-    private boolean hasExtSign(Block container, Block exclude) {
+    /** 检查容器/门周围是否还有其他扩展牌（第1行含【，排除被拆的 b） */
+    private boolean hasExtSign(Block target, Block exclude) {
         BlockFace[] faces = {BlockFace.NORTH, BlockFace.SOUTH, BlockFace.EAST, BlockFace.WEST,
                 BlockFace.UP, BlockFace.DOWN};
         for (BlockFace f : faces) {
-            Block rel = container.getRelative(f);
+            Block rel = target.getRelative(f);
             if (rel.equals(exclude)) continue;
             if (rel.getState() instanceof Sign) {
                 Sign sign = (Sign) rel.getState();
@@ -295,21 +318,21 @@ public class ChestLockListener implements Listener {
     }
 
     /** 从被拆的扩展牌第3/4行移除对应授权玩家 */
-    private void removeAccessFromSign(Block container, Sign sign) {
+    private void removeAccessFromSign(Block target, Sign sign) {
         java.util.Set<UUID> toRemove = new java.util.HashSet<>();
         collectAccessFromLines(toRemove, sign.getLine(2), sign.getLine(3));
-        for (UUID u : toRemove) manager.removeAccessDirect(container, u);
+        for (UUID u : toRemove) manager.removeAccessDirect(target, u);
     }
 
     // ===== 防破坏：爆炸 =====
     @EventHandler(ignoreCancelled = true)
     public void onExplode(EntityExplodeEvent e) {
-        e.blockList().removeIf(b -> isContainer(b.getType()) && manager.isLocked(b));
+        e.blockList().removeIf(b -> isLockable(b.getType()) && manager.isLocked(doorBottom(b)));
     }
 
     @EventHandler(ignoreCancelled = true)
     public void onBlockExplode(BlockExplodeEvent e) {
-        e.blockList().removeIf(b -> isContainer(b.getType()) && manager.isLocked(b));
+        e.blockList().removeIf(b -> isLockable(b.getType()) && manager.isLocked(doorBottom(b)));
     }
 
     // ===== 防漏斗 =====
@@ -318,9 +341,73 @@ public class ChestLockListener implements Listener {
         if (e.getSource().getLocation() == null || e.getDestination().getLocation() == null) return;
         Block src = e.getSource().getLocation().getBlock();
         Block dst = e.getDestination().getLocation().getBlock();
-        if ((isContainer(src.getType()) && manager.isLocked(src))
-                || (isContainer(dst.getType()) && manager.isLocked(dst))) {
+        if ((isLockable(src.getType()) && manager.isLocked(doorBottom(src)))
+                || (isLockable(dst.getType()) && manager.isLocked(doorBottom(dst)))) {
             e.setCancelled(true);
         }
+    }
+
+    // ===== 遍历牌子相邻方块找可锁目标（容器 + 门），多门时按优先级只选一个 =====
+    private Block findAttachedLockable(Block signBlock) {
+        // 先收集所有相邻可锁方块
+        java.util.List<Block> candidates = new java.util.ArrayList<>();
+        BlockFace[] faces = {BlockFace.NORTH, BlockFace.SOUTH, BlockFace.EAST, BlockFace.WEST,
+                BlockFace.UP, BlockFace.DOWN};
+        for (BlockFace f : faces) {
+            Block rel = signBlock.getRelative(f);
+            if (isLockable(rel.getType())) candidates.add(rel);
+        }
+        if (candidates.isEmpty()) return null;
+        // 有已上锁的候选 → 优先返回已上锁的（防止解牌时找错目标）
+        for (Block b : candidates) {
+            Block norm = isDoor(b.getType()) ? doorBottom(b) : b;
+            if (manager.isLocked(norm)) return norm;
+        }
+        // 都没锁 → 按优先级选一个（放置时用）
+        java.util.Map<BlockFace, Integer> priority = new java.util.HashMap<>();
+        priority.put(BlockFace.WEST, 1);   // 左
+        priority.put(BlockFace.NORTH, 2);  // 前
+        priority.put(BlockFace.SOUTH, 2);  // 后
+        priority.put(BlockFace.EAST, 3);   // 右
+        priority.put(BlockFace.UP, 4);     // 上（牌子在门上方 → 锁下面的门）
+        priority.put(BlockFace.DOWN, 5);   // 下
+        Block best = candidates.get(0);
+        int bestP = 999;
+        for (int i = 0; i < candidates.size(); i++) {
+            Block b = candidates.get(i);
+            BlockFace dir = faceOf(signBlock, b);
+            int p = priority.getOrDefault(dir, 5);
+            if (p < bestP) {
+                bestP = p;
+                best = b;
+            }
+        }
+        return best;
+    }
+
+    /** 返回 rel 相对于 origin 的 BlockFace（仅水平4方向 + 上下） */
+    private BlockFace faceOf(Block origin, Block rel) {
+        int dx = rel.getX() - origin.getX();
+        int dy = rel.getY() - origin.getY();
+        int dz = rel.getZ() - origin.getZ();
+        if (dx == 1) return BlockFace.EAST;
+        if (dx == -1) return BlockFace.WEST;
+        if (dz == 1) return BlockFace.SOUTH;
+        if (dz == -1) return BlockFace.NORTH;
+        if (dy == 1) return BlockFace.UP;
+        if (dy == -1) return BlockFace.DOWN;
+        return BlockFace.SELF;
+    }
+
+    /** 旧方法保留（兼容外部调用） */
+    @Deprecated
+    private Block findAttachedContainer(Block signBlock) {
+        BlockFace[] faces = {BlockFace.NORTH, BlockFace.SOUTH, BlockFace.EAST, BlockFace.WEST,
+                BlockFace.UP, BlockFace.DOWN};
+        for (BlockFace f : faces) {
+            Block rel = signBlock.getRelative(f);
+            if (isContainer(rel.getType())) return rel;
+        }
+        return null;
     }
 }
