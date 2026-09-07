@@ -2,6 +2,7 @@ package nl.tinyaii.chestlock.data;
 
 import nl.tinyaii.chestlock.ChestLockPlugin;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.block.Sign;
@@ -17,7 +18,8 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * 锁箱数据：容器坐标 → 主人UUID + 授权玩家列表，data.yml 持久化。
+ * 锁箱/锁门数据：容器/门坐标 → 主人UUID + 授权玩家列表，data.yml 持久化。
+ * 门是上下两格，统一用底部方块作为 key，避免数据错乱。
  */
 public class LockManager {
 
@@ -72,65 +74,103 @@ public class LockManager {
             if (!plugin.getDataFolder().exists()) plugin.getDataFolder().mkdirs();
             yml.save(file);
         } catch (IOException ex) {
-            plugin.getLogger().severe("保存锁箱数据失败: " + ex.getMessage());
+            plugin.getLogger().severe("保存锁数据失败: " + ex.getMessage());
         }
     }
 
-    private String key(Location loc) {
-        return loc.getWorld().getName() + "," + loc.getBlockX() + "," + loc.getBlockY() + "," + loc.getBlockZ();
+    /** 用坐标字符串作 key（调用方需传入归一化后的方块，门统一用底部） */
+    private String key(Block block) {
+        Location loc = block.getLocation();
+        return loc.getWorld().getName() + ","
+                + loc.getBlockX() + ","
+                + loc.getBlockY() + ","
+                + loc.getBlockZ();
     }
 
-    public boolean isLocked(Block container) {
-        return locks.containsKey(key(container.getLocation()));
+    /** 门 → 取底部方块；非门 → 原方块 */
+    public Block doorBottom(Block block) {
+        if (!isDoor(block.getType())) return block;
+        try {
+            org.bukkit.block.data.type.Door door = (org.bukkit.block.data.type.Door) block.getBlockData();
+            if (door.getHalf() == org.bukkit.block.data.type.Door.Half.BOTTOM) return block;
+            Block below = block.getRelative(BlockFace.DOWN);
+            if (below.getType() == block.getType()) return below;
+        } catch (Exception ignored) {}
+        return block;
     }
 
-    public UUID getOwner(Block container) {
-        return locks.get(key(container.getLocation()));
+    private boolean isDoor(Material m) {
+        return m != null && m.name().endsWith("_DOOR");
     }
 
-    public void lock(Block container, UUID owner) {
-        locks.put(key(container.getLocation()), owner);
+    public boolean isLockable(Block block) {
+        return isContainer(block.getType()) || isDoor(block.getType());
+    }
+
+    private boolean isContainer(Material m) {
+        return m == Material.CHEST || m == Material.TRAPPED_CHEST || m == Material.BARREL
+                || m == Material.FURNACE || m == Material.BLAST_FURNACE || m == Material.SMOKER
+                || m == Material.BREWING_STAND || m == Material.HOPPER
+                || m == Material.DISPENSER || m == Material.DROPPER
+                || m == Material.ANVIL || m == Material.CHIPPED_ANVIL || m == Material.DAMAGED_ANVIL
+                || (plugin.getConfig().getBoolean("settings.allow-shulker", true) && isShulker(m));
+    }
+
+    private boolean isShulker(Material m) {
+        return m.name().endsWith("_SHULKER_BOX");
+    }
+
+    public boolean isLocked(Block block) {
+        return locks.containsKey(key(block));
+    }
+
+    public UUID getOwner(Block block) {
+        return locks.get(key(block));
+    }
+
+    public void lock(Block block, UUID owner) {
+        locks.put(key(block), owner);
         save();
     }
 
-    public boolean unlock(Block container) {
-        boolean ok = locks.remove(key(container.getLocation())) != null;
-        access.remove(key(container.getLocation()));
+    public boolean unlock(Block block) {
+        boolean ok = locks.remove(key(block)) != null;
+        access.remove(key(block));
         if (ok) save();
         return ok;
     }
 
     // ===== 授权玩家（只有打开权，不能拆）=====
-    public List<UUID> getAccessList(Block container) {
-        return new ArrayList<>(access.getOrDefault(key(container.getLocation()), new ArrayList<>()));
+    public List<UUID> getAccessList(Block block) {
+        return new ArrayList<>(access.getOrDefault(key(block), new ArrayList<>()));
     }
 
-    public boolean hasAccess(Block container, UUID uuid) {
-        List<UUID> list = access.get(key(container.getLocation()));
+    public boolean hasAccess(Block block, UUID uuid) {
+        List<UUID> list = access.get(key(block));
         return list != null && list.contains(uuid);
     }
 
-    public void addAccessDirect(Block container, UUID uuid) {
-        List<UUID> list = access.computeIfAbsent(key(container.getLocation()), k -> new ArrayList<>());
+    public void addAccessDirect(Block block, UUID uuid) {
+        List<UUID> list = access.computeIfAbsent(key(block), k -> new ArrayList<>());
         if (!list.contains(uuid)) list.add(uuid);
     }
 
-    public void clearAccess(Block container) {
-        access.remove(key(container.getLocation()));
+    public void clearAccess(Block block) {
+        access.remove(key(block));
     }
 
     /** 移除单个授权玩家（拆扩展牌时移除该牌上的授权名） */
-    public void removeAccessDirect(Block container, UUID uuid) {
-        List<UUID> list = access.get(key(container.getLocation()));
+    public void removeAccessDirect(Block block, UUID uuid) {
+        List<UUID> list = access.get(key(block));
         if (list != null) {
             list.remove(uuid);
-            if (list.isEmpty()) access.remove(key(container.getLocation()));
+            if (list.isEmpty()) access.remove(key(block));
         }
     }
 
     /** 把授权玩家名拼成一行（【名1 名2 ...】） */
-    public String joinAccessNames(Block container) {
-        List<UUID> list = getAccessList(container);
+    public String joinAccessNames(Block block) {
+        List<UUID> list = getAccessList(block);
         if (list.isEmpty()) return "【...】";
         StringBuilder sb = new StringBuilder("【");
         for (int i = 0; i < list.size(); i++) {
@@ -142,22 +182,35 @@ public class LockManager {
         return sb.toString();
     }
 
-    /** 同步容器相邻锁牌/扩展牌第3行显示授权名 */
-    public void syncSignAccess(Block container) {
+    /** 同步容器/门相邻锁牌/扩展牌第3行显示授权名 */
+    public void syncSignAccess(Block block) {
         BlockFace[] faces = {BlockFace.NORTH, BlockFace.SOUTH, BlockFace.EAST, BlockFace.WEST,
                 BlockFace.UP, BlockFace.DOWN};
         for (BlockFace f : faces) {
-            Block rel = container.getRelative(f);
+            Block rel = block.getRelative(f);
             if (rel.getState() instanceof Sign) {
                 Sign sign = (Sign) rel.getState();
                 String line0 = sign.getLine(0);
                 // 锁牌（含 [锁]）或扩展牌（含 【）→ 更新第3行授权
                 if (line0 != null && (line0.contains("锁") || line0.contains("【"))) {
                     sign.setLine(2, org.bukkit.ChatColor.translateAlternateColorCodes('&',
-                            joinAccessNames(container)));
+                            joinAccessNames(block)));
                     sign.update(true, false);
                 }
             }
         }
+    }
+
+    /** 从牌子反查相邻可锁目标（容器+门），返回其主人UUID */
+    public UUID getOwnerFromSign(Block signBlock) {
+        BlockFace[] faces = {BlockFace.NORTH, BlockFace.SOUTH, BlockFace.EAST, BlockFace.WEST,
+                BlockFace.UP, BlockFace.DOWN};
+        for (BlockFace f : faces) {
+            Block rel = signBlock.getRelative(f);
+            if (isLockable(rel) && isLocked(rel)) {
+                return getOwner(rel);
+            }
+        }
+        return null;
     }
 }
